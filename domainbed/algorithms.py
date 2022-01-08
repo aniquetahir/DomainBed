@@ -26,6 +26,7 @@ ALGORITHMS = [
     'ERM',
     'Fish',
     'IRM',
+    'DropoutIRM',
     'GroupDRO',
     'Mixup',
     'MLDG',
@@ -80,6 +81,9 @@ class Algorithm(torch.nn.Module):
 
     def predict(self, x):
         raise NotImplementedError
+
+
+
 
 class ERM(Algorithm):
     """
@@ -207,22 +211,35 @@ class ContextERM(ERM):
                                                  num_layers=1, batch_first=True, bidirectional=True)
         self.environment_predictor = torch.nn.Linear(2 * num_hidden_features, num_domains) # 2 for bidirectional
         self.complete_environment_predictor = torch.nn.Sequential(self.environment_detector, self.environment_predictor)
-        self.network = ContextNetwork(input_shape, 2 * num_hidden_features, num_classes, hparams)
-        all_params = list(self.environment_detector.parameters()) + \
-                         list(self.environment_predictor.parameters()) + \
-                         list(self.network.parameters())
+
+        # self.network = ContextNetwork(input_shape, 2 * num_hidden_features, num_classes, hparams)
+
+        environment_predictor_params = list(self.environment_detector.parameters()) + \
+                                        list(self.environment_predictor.parameters())
+
+        classifier_params = self.network.parameters()
+        # all_params = list(self.environment_detector.parameters()) + \
+        #                  list(self.environment_predictor.parameters()) + \
+        #                  list(self.network.parameters())
+
         self.optimizer = torch.optim.Adam(
-            all_params,
+            classifier_params,
             lr=self.hparams['lr'],
             weight_decay=self.hparams['weight_decay']
         )
 
-
+        self.environment_optimizer = torch.optim.Adam(
+            environment_predictor_params,
+            lr=0.007, # The name is Bond. James Bond
+            weight_decay=self.hparams['weight_decay']
+        )
 
 
     def update(self, minibatches, unlabeled=None):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         num_train_envs = len(minibatches)
+
+        batch_size = self.hparams['batch_size']
 
         # For each training environment
         gt_envs = []
@@ -235,15 +252,20 @@ class ContextERM(ERM):
         enum_select_mid_confidence = 'mc'
 
         # TODO multi-dimensional mixup ratio for more than 2 training environments
-        sample_selection_cap = int(num_train_envs * 0.3)
-        mixup_ratio = 0.9
-        num_main_samples = int(sample_selection_cap * mixup_ratio)
-        num_secondary_samples = sample_selection_cap - num_main_samples
-        main_environment = random.choice(num_train_envs)
+        sample_selection_cap = int(batch_size * 0.3)
+        num_env_samples = int(sample_selection_cap / num_train_envs)
+        # Mixup can be randomized(maybe according to power law to introduce distributional bias
+        # mixup_ratio = 0.9
+        # num_main_samples = int(sample_selection_cap * mixup_ratio)
+        # num_secondary_samples = sample_selection_cap - num_main_samples
+
+        augmentation_environment = random.choice(range(num_train_envs))
+        augmented_batch_x = []
+        augmented_batch_y = []
 
         for i, env_batch in enumerate(minibatches):
             # Get the batch data
-            x, _ = env_batch
+            x, y = env_batch
             flat_x = torch.flatten(x, start_dim=1)
             batch_len = len(x)
             # environment predictions = environment id
@@ -256,37 +278,49 @@ class ContextERM(ERM):
             env_fts.append(torch.ones(batch_len, 1).to(device) * torch.mean(m_env_feats, axis=0))
             # env_fts.append(torch.ones(batch_len, 1).to(device) * m_env_feats[-1])  # The prediction for the last
             preds = self.environment_predictor(m_env_feats)
+            obj_probs = preds[:, augmentation_environment]
+            obj_probs -= torch.min(obj_probs)
+            obj_probs /= torch.sum(obj_probs)
+            obj_indices = range(batch_len)
+
+            augmented_dataset_indices = np.random.choice(obj_indices, size=num_env_samples, replace=False, p=obj_probs.detach().cpu().numpy())
+            # augmented_dataset_indices = random.choices(obj_indices, obj_probs, k=num_env_samples)
+            augmented_batch_x.append(x[augmented_dataset_indices])
+            augmented_batch_y.append(y[augmented_dataset_indices])
+
             gt_envs.append(gt)
             pred_envs.append(preds)
             seq_importances.append(torch.linspace(0, 1, batch_len))
 
-        loss_env_predictor = F.cross_entropy(torch.vstack(pred_envs), torch.cat(gt_envs).type(torch.long))
 
         # Train the normal erm featurizer
         env_fts = torch.vstack(env_fts)
-        all_x = torch.cat([x for x, y in minibatches])
-        all_y = torch.cat([y for x, y in minibatches])
-        loss_label_predictor = F.cross_entropy(self.network(all_x, env_fts), all_y)
+        all_x = torch.vstack(augmented_batch_x)
+        all_y = torch.cat(augmented_batch_y)
+        # all_x = torch.cat([x for x, y in minibatches])
+        # all_y = torch.cat([y for x, y in minibatches])
 
-        total_loss = loss_env_predictor + loss_label_predictor
+        loss_env_predictor = F.cross_entropy(torch.vstack(pred_envs), torch.cat(gt_envs).type(torch.long))
+        loss_label_predictor = F.cross_entropy(self.network(all_x), all_y)
 
         self.optimizer.zero_grad()
-        total_loss.backward()
+        loss_label_predictor.backward()
         self.optimizer.step()
 
-        return {'loss': total_loss.item()}
+        self.environment_optimizer.zero_grad()
+        loss_env_predictor.backward()
+        self.environment_optimizer.step()
+
+        return {'loss': loss_label_predictor.item(), 'env_pred_loss': loss_env_predictor.item()}
 
     def predict(self, x):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        flat_x = torch.flatten(x, start_dim=1)
-        reshaped_x = flat_x.reshape(torch.cat([torch.tensor([1]), torch.tensor(flat_x.shape)]).tolist())
-        m_env_feats = self.environment_detector(reshaped_x)[0][0]
-        m_env_feats = torch.ones(x.shape[0], 1).to(device) * torch.mean(m_env_feats, axis=0)
+        # flat_x = torch.flatten(x, start_dim=1)
+        # reshaped_x = flat_x.reshape(torch.cat([torch.tensor([1]), torch.tensor(flat_x.shape)]).tolist())
+        # m_env_feats = self.environment_detector(reshaped_x)[0][0]
+        # m_env_feats = torch.ones(x.shape[0], 1).to(device) * torch.mean(m_env_feats, axis=0)
         # env_preds = self.environment_predictor(m_env_feats)
-        return self.network(x, m_env_feats)
-
-        pass
-
+        return self.network(x)
 
 
 class ARM(ERM):
@@ -564,6 +598,149 @@ class IRM(ERM):
         self.update_count += 1
         return {'loss': loss.item(), 'nll': nll.item(),
             'penalty': penalty.item()}
+
+
+class DropoutIRM(IRM):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(DropoutIRM, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.featurizer = networks.FeaturizerDropout(input_shape, hparams)
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=hparams['lr'],
+            weight_decay=hparams['weight_decay']
+        )
+        self.num_dropout_predictions = hparams['num_verifications']
+        self.input_shape = input_shape
+        self.num_classes = num_classes
+        self.distilled_model = None
+        self.stored_training = []
+        self.num_stored_samples = 4098
+
+    def update(self, minibatches, unlabeled=None):
+        with torch.no_grad():
+            if len(self.stored_training) * self.hparams['batch_size'] < self.num_stored_samples:
+                self.stored_training = self.stored_training + [(x.detach().cpu(), y.detach().cpu()) for x,y in minibatches]
+        return super().update(minibatches, unlabeled)
+
+    @staticmethod
+    def self_distill(hparams, input_shape, num_classes, trained_model, train_loaders, test_batch):#, steps, lr, deepness=4, num_confirmations=10, filter_ratio=0.3):
+        # define the current model
+        def mean_accuracy(logits, y):
+            logits_to_y = torch.argmax(logits, dim=1)
+            return (logits_to_y == y).float().mean()
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        num_epochs = 10
+        current_model = trained_model
+        for d in range(hparams['distillation_deep']):
+            print(d)
+            pred_history = []
+            pred_logits_history = []
+            # x = []
+            # y = []
+            # for z in test_loaders:
+            #     for i, (m_x, m_y) in enumerate(z):
+            #         x.append(m_x)
+            #         y.append(m_y)
+            #         if i>data_limit:
+            #             break
+
+            # test_data = [(x, y) for z in test_loaders for x, y in z]
+            # x, y = list(zip(*test_data))
+            # x = [y for x in test_envs for y in x['images']]
+            # y = [y for x in test_envs for y in x['labels']]
+            # x = torch.stack(x)
+            # y = torch.stack(y)
+
+            # TODO incorporate test data
+
+
+            # define the distilled model
+            # sample_train_x, _ = next(iter(train_loaders[0]))
+            featurizer = networks.FeaturizerDropout(input_shape, hparams)
+            classifier = networks.Classifier(featurizer.n_outputs, num_classes, hparams['nonlinear_classifier'])
+            distilled_model = torch.nn.Sequential(featurizer, classifier).to(device) #.cuda()
+            optimizer = torch.optim.Adam(distilled_model.parameters(), lr=hparams['distillation_lr'])
+
+            # pseudo label the test data
+            # x = []
+            # y = []
+            # for j in test_loaders:
+            #     for i, (m_x, m_y) in enumerate(j):
+            #         x.append(m_x)
+            #         y.append(m_y)
+            #         if i > num_epochs:
+            #             break
+            x = test_batch # torch.vstack(x)
+            # y = torch.cat(y)
+
+            for i in range(hparams['num_confirmations']):
+                with torch.no_grad():
+                    pred_logits = current_model(x).detach()
+                    pred_history.append(torch.argmax(pred_logits, axis=1))
+                    pred_logits_history.append((pred_logits))
+
+            # filter the top confidence samples from the test data
+            with torch.no_grad():
+                pred_history = torch.stack(pred_history)
+                pred_logits_history = torch.stack(pred_logits_history)
+                pred_variation = pred_history.float().var(axis=0)
+
+                mean_prediction = torch.mean(pred_logits_history, dim = 0)
+                modal_prediction = torch.mode(pred_history, dim=0).values
+
+                hci = torch.sort(pred_variation.flatten()).indices
+                num_filtered_samples = int(len(hci) * filter_ratio)
+
+                zero_var_sample_indices = torch.where(pred_variation == 0)[0]
+                if len(zero_var_sample_indices) > num_filtered_samples:
+                    hci = zero_var_sample_indices
+                    num_filtered_samples = len(zero_var_sample_indices)
+
+                new_x = x[hci[:num_filtered_samples]]
+                new_y = modal_prediction[hci[:num_filtered_samples]]
+            # new_gt_y = y[hci[:num_filtered_samples]]
+
+            # For logging purposes, print the accuracy of the most confident predictions
+
+            torch.cuda.empty_cache()
+            # train on the top confidence samples
+            for step in range(hparams['distillation_step']):
+                logits = distilled_model(new_x)
+                nll = F.cross_entropy(logits, new_y)  # mean_nll(logits, new_y)
+                optimizer.zero_grad()
+                nll.backward()
+                optimizer.step()
+                del logits, nll
+                # if step % 300 == 0:
+                #     # print('=' * 10)
+                #     distilled_model.eval()
+                #     # print(f'--> Test Accuracy: {mean_accuracy(distilled_model(x).detach(), y)}')
+                #     distilled_model.train()
+
+            # update the current model
+            current_model = distilled_model
+            torch.cuda.empty_cache()
+            # print(f'Final Test Accuracy: {mean_accuracy(distilled_model(x).detach(), y)}')
+            pass
+        return current_model
+
+    def predict(self, x, train_distillation=False, no_distill=True):
+        if no_distill:
+            print("No distill is True")
+            return self.network(x)
+        if train_distillation:
+            print("Train Distillation is True")
+            self.network.train()
+            # self distill based on the provided data
+            distilled_model = self.self_distill(self.hparams, self.input_shape, self.num_classes, self.network, None, x)#, 50, self.hparams['lr']*0.01)
+            self.network.eval()
+            self.distilled_model = distilled_model
+
+        # apply the self distilled model on the data to get the class
+        print("Both are false")
+        return self.distilled_model(x)
 
 
 class VREx(ERM):
