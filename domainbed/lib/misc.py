@@ -158,6 +158,7 @@ def accuracy(network, loader, weights, device, no_distill=True):
     # with torch.no_grad():
     train_distillation = True
     for x, y in loader:
+        torch.cuda.empty_cache()
         x = x.to(device)
         y = y.to(device)
         if train_distillation:
