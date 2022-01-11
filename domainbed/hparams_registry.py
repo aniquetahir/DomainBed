@@ -29,7 +29,7 @@ def _hparams(algorithm, dataset, random_seed):
 
     _hparam('data_augmentation', True, lambda r: True)
     _hparam('resnet18', False, lambda r: False)
-    _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
+    _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.25, 0.5, 0.75]))
     _hparam('class_balanced', False, lambda r: False)
     # TODO: nonlinear classifiers disabled
     _hparam('nonlinear_classifier', False,
@@ -66,7 +66,8 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('irm_lambda', 1e2, lambda r: 10 ** r.uniform(-1, 5))
         _hparam('irm_penalty_anneal_iters', 500,
                 lambda r: int(10 ** r.uniform(0, 4)))
-        _hparam('mlp_dropout',0.5, lambda r: r.uniform(0,1))
+        _hparam('mlp_dropout',0.5, lambda r: r.uniform(0.,1.))
+        # _hparam('resnet_dropout', 0.5,  lambda r: r.uniform(0., 1.))
         _hparam('num_confirmations', 10, lambda r: 10 ** r.uniform(0, 2))
         _hparam('num_verifications', 10, lambda r: 10 ** r.uniform(0, 2))
         _hparam('distillation_step', 10, lambda r: 10**r.uniform(0, 3))
